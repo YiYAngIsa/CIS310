@@ -257,6 +257,281 @@ def report_csv(frame: pd.DataFrame) -> bytes:
     return safe.to_csv(index=False, date_format="%m/%d/%Y").encode("utf-8-sig")
 
 
+# ------------------------ Custom chart builder helpers -------------------- #
+CUSTOM_CHART_TYPES = (
+    "Scatter plot", "Line chart", "Bar chart", "Histogram", "Box plot",
+    "Violin plot", "Pie chart",
+)
+CUSTOM_DATA_VIEWS = (
+    "Order line items", "Unique orders", "Customer summaries", "Monthly by category",
+)
+AGGREGATIONS = ("Sum", "Average", "Median", "Count rows", "Distinct orders")
+TIME_GRAINS = ("Day", "Week", "Month", "Quarter", "Year")
+
+
+def prepare_custom_view(frame: pd.DataFrame, view: str) -> pd.DataFrame:
+    """Create safe, filter-aware chart datasets at clearly defined levels."""
+    work = frame.copy()
+    # Leave the original source and shared filtered frame untouched.
+    work["Order Date"] = work["Order Date Parsed"]
+    work["Ship Date"] = work["Ship Date Parsed"]
+    work["Region"] = work["Region Display"]
+    work["Returned"] = work["Returned"].map({True: "Yes", False: "No"})
+
+    if view == "Order line items":
+        cols = [
+            "Row ID", "Order ID", "Customer ID", "Order Date", "Ship Date",
+            "Ship Mode", "Category", "Sub-Category", "Product ID", "Product Name",
+            "Segment", "Country", "Region", "Returned", "Sales", "Profit",
+            "Quantity", "Discount",
+        ]
+        return work[[c for c in cols if c in work]].copy()
+
+    if view == "Unique orders":
+        # One order can have products in several categories; don't randomly
+        # choose one category for it.
+        result = (
+            work.groupby("Order ID", as_index=False, dropna=False)
+            .agg(
+                **{
+                    "Customer ID": ("Customer ID", "first"),
+                    "Order Date": ("Order Date", "min"),
+                    "Ship Date": ("Ship Date", "min"),
+                    "Category": (
+                        "Category",
+                        lambda values: values.iloc[0]
+                        if values.nunique(dropna=False) == 1 else "Multiple categories",
+                    ),
+                    "Segment": ("Segment", "first"),
+                    "Region": ("Region", "first"),
+                    "Returned": ("Returned", "first"),
+                    "Sales": ("Sales", "sum"),
+                    "Profit": ("Profit", "sum"),
+                    "Quantity": ("Quantity", "sum"),
+                    "Discount": ("Discount", "mean"),
+                    "Order Lines": ("Order ID", "size"),
+                }
+            )
+        )
+        return result
+
+    if view == "Customer summaries":
+        return (
+            work.groupby("Customer ID", as_index=False, dropna=False)
+            .agg(
+                **{
+                    "Segment": ("Segment", "first"),
+                    "Country": ("Country", "first"),
+                    "Region": ("Region", "first"),
+                    "Sales": ("Sales", "sum"),
+                    "Profit": ("Profit", "sum"),
+                    "Quantity": ("Quantity", "sum"),
+                    "Discount": ("Discount", "mean"),
+                    "Order Count": ("Order ID", "nunique"),
+                    "Order Lines": ("Order ID", "size"),
+                }
+            )
+        )
+
+    if view == "Monthly by category":
+        work["Month"] = work["Order Date"].dt.to_period("M").dt.to_timestamp()
+        return (
+            work.groupby(["Month", "Category"], as_index=False, dropna=False)
+            .agg(
+                **{
+                    "Sales": ("Sales", "sum"),
+                    "Profit": ("Profit", "sum"),
+                    "Quantity": ("Quantity", "sum"),
+                    "Order Count": ("Order ID", "nunique"),
+                    "Order Lines": ("Order ID", "size"),
+                }
+            )
+        )
+
+    raise ValueError(f"Unknown chart data view: {view}")
+
+
+def classify_chart_columns(frame: pd.DataFrame):
+    """Return numeric, temporal and categorical columns for type-safe inputs."""
+    numeric = [
+        c for c in frame.columns
+        if pd.api.types.is_numeric_dtype(frame[c])
+        and not pd.api.types.is_bool_dtype(frame[c])
+    ]
+    temporal = [
+        c for c in frame.columns
+        if pd.api.types.is_datetime64_any_dtype(frame[c])
+    ]
+    categorical = [c for c in frame.columns if c not in numeric + temporal]
+    return numeric, temporal, categorical
+
+
+def custom_chart_default(options, preferred: str) -> int:
+    return list(options).index(preferred) if preferred in options else 0
+
+
+def group_chart_data(
+    frame: pd.DataFrame,
+    x: str,
+    y: str,
+    group: str | None,
+    aggregation: str,
+    date_grain: str,
+) -> pd.DataFrame:
+    """Aggregate explicit X/(color) groups; don't join raw lines in a time plot."""
+    table = frame.copy()
+    if pd.api.types.is_datetime64_any_dtype(table[x]):
+        freqs = {"Day": "D", "Week": "W-SUN", "Month": "M", "Quarter": "Q", "Year": "Y"}
+        table["Chart X"] = table[x].dt.to_period(freqs[date_grain]).dt.start_time
+    else:
+        table["Chart X"] = table[x]
+
+    group_columns = ["Chart X"]
+    if group is not None and group != x:
+        table["Chart Group"] = table[group]
+        group_columns.append("Chart Group")
+
+    if aggregation == "Count rows":
+        plotted = table.groupby(group_columns, dropna=False, observed=True).size().reset_index(name="Value")
+    elif aggregation == "Distinct orders":
+        if "Order ID" not in table:
+            raise ValueError("Distinct orders is available only for order-level datasets.")
+        plotted = (
+            table.groupby(group_columns, dropna=False, observed=True)["Order ID"]
+            .nunique().reset_index(name="Value")
+        )
+    else:
+        rule = {"Sum": "sum", "Average": "mean", "Median": "median"}[aggregation]
+        plotted = (
+            table.groupby(group_columns, dropna=False, observed=True)[y]
+            .agg(rule).reset_index(name="Value")
+        )
+    return plotted.sort_values("Chart X")
+
+
+def make_custom_chart(
+    frame: pd.DataFrame,
+    kind: str,
+    *,
+    x: str,
+    y: str | None = None,
+    group: str | None = None,
+    size: str | None = None,
+    aggregation: str = "Sum",
+    date_grain: str = "Month",
+    bins: int = 25,
+    top_n: int = 20,
+    orientation: str = "Vertical",
+    highlight_quarter: bool = False,
+) -> tuple[go.Figure | None, pd.DataFrame, str | None]:
+    """Build a Plotly figure plus the underlying plotted data and any warning.
+
+    These functions are independent of Streamlit widgets so they can be tested.
+    """
+    if frame.empty:
+        return None, frame.copy(), "No records match the selected filters."
+    if kind == "Scatter plot":
+        required = [x, y] + ([group] if group else []) + ([size] if size else [])
+        raw = frame.dropna(subset=required).copy()
+        if raw.empty:
+            return None, raw, "No complete records for the selected variables."
+        if size and (raw[size] < 0).any():
+            return None, raw, "Bubble size must be nonnegative. Choose a different size variable."
+        fig = px.scatter(
+            raw, x=x, y=y, color=group, size=size, opacity=0.66,
+            hover_data=[c for c in ("Order ID", "Customer ID") if c in raw and c not in required],
+            labels={x: x, y: y}, render_mode="auto",
+        )
+        return style_figure(fig, height=540), raw, None
+
+    if kind == "Histogram":
+        raw = frame.dropna(subset=[x] + ([group] if group else [])).copy()
+        if raw.empty:
+            return None, raw, "No values available for this histogram."
+        fig = px.histogram(raw, x=x, color=group, nbins=bins, barmode="overlay", opacity=0.75)
+        fig.update_yaxes(title_text="Number of records")
+        return style_figure(fig, height=520), raw, None
+
+    if kind in ("Box plot", "Violin plot"):
+        raw = frame.dropna(subset=[x, y] + ([group] if group else [])).copy()
+        if raw.empty:
+            return None, raw, "No complete records for the selected variables."
+        if kind == "Box plot":
+            fig = px.box(raw, x=x, y=y, color=group, points=False)
+        else:
+            fig = px.violin(raw, x=x, y=y, color=group, box=True)
+        return style_figure(fig, height=540), raw, None
+
+    raw = frame.dropna(subset=[x] + ([group] if group else [])).copy()
+    if raw.empty:
+        return None, raw, "No complete records for the selected variables."
+    result = group_chart_data(raw, x, y, group, aggregation, date_grain)
+    if result.empty:
+        return None, result, "No values remain after aggregation."
+
+    if kind == "Line chart":
+        if result["Chart X"].nunique() > 240:
+            return None, result, "Too many X values for a readable line chart. Choose a date or less granular variable."
+        fig = px.line(
+            result, x="Chart X", y="Value",
+            color="Chart Group" if "Chart Group" in result else None,
+            markers=True,
+        )
+        if (highlight_quarter and pd.api.types.is_datetime64_any_dtype(result["Chart X"])
+                and date_grain not in ("Quarter", "Year")):
+            years = sorted(result["Chart X"].dt.year.unique())
+            shade_q4(fig, [int(year) for year in years])
+        fig.update_layout(xaxis_title=x, yaxis_title=f"{aggregation} of {y}" if y else aggregation)
+        return style_figure(fig, height=530), result, None
+
+    if kind == "Bar chart":
+        # Protect readability for high-cardinality columns, e.g., Product Name.
+        if result["Chart X"].nunique() > top_n:
+            most_important = (
+                result.groupby("Chart X", dropna=False)["Value"].sum()
+                .abs().sort_values(ascending=False).head(top_n).index
+            )
+            result = result[result["Chart X"].isin(most_important)].copy()
+            notice = f"Showing the {top_n} largest X groups by absolute aggregated value."
+        else:
+            notice = None
+        color = "Chart Group" if "Chart Group" in result else None
+        if orientation == "Horizontal":
+            fig = px.bar(result, x="Value", y="Chart X", color=color, orientation="h", barmode="group")
+            fig.update_layout(xaxis_title=f"{aggregation} of {y}" if y else aggregation, yaxis_title=x)
+        else:
+            fig = px.bar(result, x="Chart X", y="Value", color=color, barmode="group")
+            fig.update_layout(xaxis_title=x, yaxis_title=f"{aggregation} of {y}" if y else aggregation)
+        return style_figure(fig, height=540), result, notice
+
+    if kind == "Pie chart":
+        # A slice of a pie must represent a strictly positive proportion.
+        if result["Value"].isna().any() or (result["Value"] < 0).any():
+            return None, result, (
+                "The selected grouping produces negative or missing values. "
+                "A pie chart cannot represent these faithfully. Try a bar chart, "
+                "or select a nonnegative metric."
+            )
+        result = result[result["Value"] > 0].copy()
+        if result.empty:
+            return None, result, "All values are zero, so there are no pie slices to display."
+        notice = None
+        if len(result) > 12:
+            # Preserve the total by combining the smallest slices into Other.
+            result = result.sort_values("Value", ascending=False)
+            other_value = float(result.iloc[11:]["Value"].sum())
+            result = result.iloc[:11].copy()
+            result = pd.concat(
+                [result, pd.DataFrame({"Chart X": ["Other"], "Value": [other_value]})],
+                ignore_index=True,
+            )
+            notice = "Grouped the smallest slices into 'Other' to keep the pie readable."
+        fig = px.pie(result, names="Chart X", values="Value", hole=0)
+        fig.update_traces(textinfo="label+percent", textposition="inside")
+        return style_figure(fig, height=540), result, notice
+
+    raise ValueError(f"Unknown chart type: {kind}")
+
 # -------------------------------- Sidebar -------------------------------- #
 st.title("📊 Customer & Sales Analytics")
 st.caption("Interactive sales, profitability, returns, and customer dashboard")
@@ -362,8 +637,8 @@ if quality["invalid_order_dates"]:
         "and cannot be allocated to a month. They are excluded from date-filtered charts."
     )
 
-sales_tab, profit_tab, return_tab, region_tab, quality_tab = st.tabs(
-    ["📈 Sales trends", "💰 Profitability", "↩️ Returns", "🗺️ Regions", "🧹 Data quality & exports"]
+sales_tab, profit_tab, return_tab, region_tab, custom_tab, quality_tab = st.tabs(
+    ["📈 Sales trends", "💰 Profitability", "↩️ Returns", "🗺️ Regions", "🎨 Custom charts", "🧹 Data quality & exports"]
 )
 
 # ------------------------------- Sales trends ------------------------------ #
@@ -539,6 +814,187 @@ with region_tab:
         f"{quality['ambiguous_region_customers']:,} of "
         f"{quality['unique_customers']:,} customers have multiple listed regions. "
         "A transaction-level address or region field would enable a reliable full regional comparison."
+    )
+
+# ---------------------------- Custom charts tab --------------------------- #
+with custom_tab:
+    st.subheader("Build your own visualization")
+    st.caption(
+        "Choose a chart type and select the variables you want to compare. "
+        "Every chart uses the date, category and segment filters in the sidebar."
+    )
+    source_view, chart_selection = st.columns([1, 1])
+    with source_view:
+        custom_view = st.selectbox(
+            "Level of analysis",
+            CUSTOM_DATA_VIEWS,
+            help="A row represents an order line, an entire order, a customer, or a month/category total.",
+            key="custom_view",
+        )
+    with chart_selection:
+        custom_kind = st.selectbox("Visualization type", CUSTOM_CHART_TYPES, key="custom_kind")
+
+    custom_data = prepare_custom_view(filtered, custom_view)
+    numeric_cols, datetime_cols, categorical_cols = classify_chart_columns(custom_data)
+    group_choices = ["(None)"] + [c for c in categorical_cols if c not in ("Product Name",)]
+
+    if custom_view == "Unique orders":
+        st.info(
+            "Orders containing more than one product category are labeled "
+            "'Multiple categories' instead of being assigned to a single category."
+        )
+    if custom_view == "Monthly by category":
+        st.caption("One row represents one month and one category; sales and profit are already summed.")
+
+    chart_x = None
+    chart_y = None
+    chart_group = None
+    chart_size = None
+    chart_agg = "Sum"
+    chart_grain = "Month"
+    chart_bins = 25
+    chart_top_n = 20
+    chart_orientation = "Vertical"
+
+    if custom_kind == "Scatter plot":
+        st.markdown("**Scatter plot:** compare two numeric measures, optionally coloring and sizing markers.")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            chart_x = st.selectbox("X axis", numeric_cols + datetime_cols,
+                                   index=custom_chart_default(numeric_cols + datetime_cols, "Sales"), key="scatter_x")
+        with col2:
+            chart_y = st.selectbox("Y axis", numeric_cols,
+                                   index=custom_chart_default(numeric_cols, "Profit"), key="scatter_y")
+        with col3:
+            color = st.selectbox("Color / group", group_choices,
+                                 index=custom_chart_default(group_choices, "Category"), key="scatter_group")
+            chart_group = None if color == "(None)" else color
+        with col4:
+            nonnegative = [c for c in numeric_cols if (custom_data[c].dropna() >= 0).all()]
+            size_options = ["(None)"] + nonnegative
+            bubble = st.selectbox("Bubble size (optional)", size_options,
+                                  index=custom_chart_default(size_options, "Quantity"), key="scatter_size")
+            chart_size = None if bubble == "(None)" else bubble
+
+    elif custom_kind in ("Line chart", "Bar chart", "Pie chart"):
+        if custom_kind == "Line chart":
+            st.markdown("**Line chart:** group by time (or another ordered variable) and aggregate a measure.")
+            x_options = datetime_cols + categorical_cols
+            default_x = "Month" if "Month" in datetime_cols else "Order Date"
+        else:
+            st.markdown("**Bar / pie chart:** group records by a category and summarize a measure.")
+            x_options = categorical_cols + datetime_cols
+            default_x = "Category"
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            chart_x = st.selectbox("Group by / X axis", x_options,
+                                   index=custom_chart_default(x_options, default_x), key="aggregate_x")
+        with col2:
+            chart_agg_options = list(AGGREGATIONS) if "Order ID" in custom_data else list(AGGREGATIONS[:-1])
+            chart_agg = st.selectbox("Aggregation", chart_agg_options, key="aggregate_method")
+        with col3:
+            if chart_agg in ("Count rows", "Distinct orders"):
+                chart_y = None
+                st.caption("No Y metric needed for this aggregation.")
+            else:
+                chart_y = st.selectbox("Y / value", numeric_cols,
+                                       index=custom_chart_default(numeric_cols, "Sales"), key="aggregate_y")
+        if custom_kind != "Pie chart":
+            opt1, opt2, opt3 = st.columns(3)
+            with opt1:
+                optional_color = ["(None)"] + [c for c in categorical_cols if c != chart_x]
+                color = st.selectbox("Color / split by", optional_color,
+                                     index=custom_chart_default(optional_color, "Category" if custom_kind == "Line chart" else "(None)"),
+                                     key="aggregate_color")
+                chart_group = None if color == "(None)" else color
+            with opt2:
+                if chart_x in datetime_cols:
+                    chart_grain = st.selectbox("Time grouping", TIME_GRAINS,
+                                               index=custom_chart_default(TIME_GRAINS, "Month"), key="time_grain")
+                else:
+                    st.caption("Time grouping appears when X is a date.")
+            with opt3:
+                if custom_kind == "Bar chart":
+                    chart_orientation = st.selectbox("Orientation", ("Vertical", "Horizontal"), key="bar_orientation")
+                    chart_top_n = st.slider("Maximum X groups", min_value=5, max_value=50,
+                                             value=20, step=5, key="bar_top_n")
+                else:
+                    st.caption("Q4 highlighting follows the sidebar setting.")
+        else:
+            st.caption("Pie charts work only with nonnegative group totals; otherwise use a bar chart.")
+
+    elif custom_kind == "Histogram":
+        st.markdown("**Histogram:** explore the distribution of one numeric measure.")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            chart_x = st.selectbox("Numeric measure", numeric_cols,
+                                   index=custom_chart_default(numeric_cols, "Sales"), key="hist_x")
+        with col2:
+            color = st.selectbox("Color / group", group_choices, key="hist_color")
+            chart_group = None if color == "(None)" else color
+        with col3:
+            chart_bins = st.slider("Number of bins", min_value=5, max_value=80, value=25, key="hist_bins")
+
+    else:  # Box plot and Violin plot
+        st.markdown("**Distribution chart:** compare a numeric variable across groups.")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            chart_x = st.selectbox("Category / X axis", categorical_cols,
+                                   index=custom_chart_default(categorical_cols, "Category"), key="distribution_x")
+        with col2:
+            chart_y = st.selectbox("Numeric / Y axis", numeric_cols,
+                                   index=custom_chart_default(numeric_cols, "Profit"), key="distribution_y")
+        with col3:
+            color = st.selectbox("Color / group", ["(None)"] + [c for c in categorical_cols if c != chart_x],
+                                 key="distribution_color")
+            chart_group = None if color == "(None)" else color
+
+    # Plotly can technically color thousands of IDs, but the resulting chart
+    # is unreadable and potentially too heavy for a free cloud app.
+    problem = None
+    if chart_group and custom_data[chart_group].nunique(dropna=True) > 25:
+        problem = "The color field has over 25 groups. Please choose a lower-cardinality field or '(None)'."
+    if (custom_kind in ("Box plot", "Violin plot") and chart_x is not None
+            and custom_data[chart_x].nunique(dropna=True) > 40):
+        problem = "The category field has over 40 groups. Please select a shorter category grouping."
+    if custom_kind == "Line chart" and chart_x in categorical_cols and custom_data[chart_x].nunique() > 80:
+        problem = "This X axis has over 80 categories. Use a date or a lower-cardinality categorical variable."
+
+    if problem:
+        st.warning(problem)
+    else:
+        chart_fig, chart_table, chart_note = make_custom_chart(
+            custom_data, custom_kind, x=chart_x, y=chart_y,
+            group=chart_group, size=chart_size, aggregation=chart_agg,
+            date_grain=chart_grain, bins=chart_bins, top_n=chart_top_n,
+            orientation=chart_orientation, highlight_quarter=highlight_q4,
+        )
+        if chart_note:
+            st.info(chart_note) if chart_fig is not None else st.warning(chart_note)
+        if chart_fig is not None:
+            st.caption(f"**Visualization type: {custom_kind}** · Data level: {custom_view} · {len(chart_table):,} plotted rows")
+            st.plotly_chart(chart_fig, use_container_width=True, key="custom_figure")
+            with st.expander("View plotted data and download"):
+                st.dataframe(chart_table.head(1000), use_container_width=True, hide_index=True)
+                st.caption("Preview shows at most 1,000 rows; CSV contains the full plotted dataset.")
+                csv_button, html_button = st.columns(2)
+                with csv_button:
+                    st.download_button(
+                        "⬇ Download plotted data (.csv)",
+                        data=report_csv(chart_table),
+                        file_name="custom_chart_data.csv", mime="text/csv", key="custom_data_download",
+                    )
+                with html_button:
+                    st.download_button(
+                        "⬇ Download interactive chart (.html)",
+                        data=chart_fig.to_html(include_plotlyjs=True, full_html=True).encode("utf-8"),
+                        file_name="custom_chart.html", mime="text/html", key="custom_html_download",
+                    )
+    st.caption(
+        "Tip: choose 'Order line items' for Sales vs Profit scatter plots; "
+        "'Customer summaries' for customer-level comparisons; and "
+        "'Monthly by category' for trend analysis. "
+        "Regional assignments are shown only when unambiguous."
     )
 
 # ---------------------------- Quality and exports -------------------------- #
